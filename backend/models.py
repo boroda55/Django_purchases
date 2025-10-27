@@ -70,6 +70,8 @@ class User(AbstractUser):
     username = models.CharField('Имя', max_length=150, validators=[username_validator])
     is_active = models.BooleanField('Активация', default=False)
     type = models.CharField('Тип пользователя',default='buyer' , max_length=5, choices=TYPE_CHOICES)
+    groups = None
+    user_permissions = None
 
     def __str__(self):
         return f'{self.email}'
@@ -97,19 +99,19 @@ class Shop(models.Model):
     def __str__(self):
         return self.name
 
-    class Category(models.Model):
-        """
-        Модель Категорий
-        """
-        name = models.CharField('Название', max_length=100)
-        shops = models.ManyToManyField(Shop, verbose_name='Магазины', related_name='shop_categories', blank=True)
+class Category(models.Model):
+    """
+    Модель Категорий
+    """
+    name = models.CharField('Название', max_length=100)
+    shops = models.ManyToManyField(Shop, verbose_name='Магазины', related_name='shop_categories', blank=True)
 
-        class Meta:
-            verbose_name = 'Категория'
-            verbose_name_plural = 'Список категорий'
+    class Meta:
+        verbose_name = 'Категория'
+        verbose_name_plural = 'Список категорий'
 
-        def __str__(self):
-            return self.name
+    def __str__(self):
+        return self.name
 
 
 class Product(models.Model):

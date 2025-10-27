@@ -41,9 +41,9 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'backend',
-    #'rest_framework.authtoken',
-    #'django_rest_passwordreset',
-    #'rest_framework',
+    'rest_framework.authtoken',
+    'django_rest_passwordreset',
+    'rest_framework',
     #'backend.apps.BackendConfig'
 
 ]
@@ -77,6 +77,17 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'purchases.wsgi.application'
 
+REST_FRAMEWORK = {
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',  # По умолчанию требуется аутентификация
+    ],
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework.authentication.TokenAuthentication',  # Для API токенов
+    ],
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20
+}
 
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
