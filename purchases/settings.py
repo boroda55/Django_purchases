@@ -52,10 +52,11 @@ MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
+    # 'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'backend.middleware.DisableCSRFMiddleware',
 ]
 
 ROOT_URLCONF = 'purchases.urls'
@@ -79,16 +80,21 @@ WSGI_APPLICATION = 'purchases.wsgi.application'
 
 REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',  # По умолчанию требуется аутентификация
+        'rest_framework.permissions.AllowAny',
     ],
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.SessionAuthentication',
-        'rest_framework.authentication.TokenAuthentication',  # Для API токенов
+        'rest_framework.authentication.TokenAuthentication',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20
 }
-
+CSRF_TRUSTED_ORIGINS = [
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    # добавьте ваши домены
+]
+CSRF_COOKIE_HTTPONLY = False
+DISABLE_CSRF_CHECK = True
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
@@ -122,6 +128,7 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+AUTH_USER_MODEL = 'backend.User'
 
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/

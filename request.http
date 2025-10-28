@@ -1,0 +1,22 @@
+@baseUrl = http://localhost:8000/
+###
+
+# импорт товаров
+# (необходимо авторизоваться и передавать токен пользователя;
+# требуемый тип пользователя - магазин)
+POST {{baseUrl}}/partner/update/
+Content-Type: application/json
+Authorization: token 51e09637715b51e01bb240894ce6071a6d81551e
+
+{
+    "url": "https://github.com/boroda55/Django_purchases/shop1.yaml"
+}
+
+###
+POST {{baseUrl}}/login/
+Content-Type: application/json
+
+{
+    "email": "1@1.ru",
+    "password": "1"
+}

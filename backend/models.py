@@ -3,7 +3,9 @@ from django.contrib.auth.models import AbstractUser
 from django.contrib.auth.validators import UnicodeUsernameValidator
 from django.db import models
 from django_rest_passwordreset.tokens import get_token_generator
+from django.dispatch import Signal
 
+new_user_registered = Signal()
 STATE_CHOICES = (
     ('basket', 'Статус корзины'),
     ('new', 'Новый'),
@@ -47,8 +49,14 @@ class UserManager(BaseUserManager):
         return self._create_user(email, password, **extra_fields)
 
     def create_superuser(self, email, password, **extra_fields):
-        extra_fields['is_staff'] = True
-        extra_fields['is_superuser'] = True
+        extra_fields.setdefault('is_staff', True)
+        extra_fields.setdefault('is_superuser', True)
+
+        if extra_fields.get('is_staff') is not True:
+            raise ValueError('Superuser must have is_staff=True.')
+        if extra_fields.get('is_superuser') is not True:
+            raise ValueError('Superuser must have is_superuser=True.')
+
         return self._create_user(email, password, **extra_fields)
 
 
@@ -56,20 +64,17 @@ class User(AbstractUser):
     """
     Модель пользователей
     """
-    TYPE_CHOICES = (
-        ('buyer', 'Покупатель'),
-        ('shop', 'Магазин')
-    )
 
-    USERNAME_FIELD = 'email'
+    REQUIRED_FIELDS = []
     objects = UserManager()
+    USERNAME_FIELD = 'email'
 
-    email = models.EmailField('Адрес электронной почты')
+    email = models.EmailField('Адрес электронной почты', unique=True)
     company = models.CharField('Компания', blank=True, max_length=100)
     username_validator = UnicodeUsernameValidator()
     username = models.CharField('Имя', max_length=150, validators=[username_validator])
     is_active = models.BooleanField('Активация', default=False)
-    type = models.CharField('Тип пользователя',default='buyer' , max_length=5, choices=TYPE_CHOICES)
+    type = models.CharField('Тип пользователя',default='buyer' , max_length=5, choices=USER_TYPE_CHOICES)
     groups = None
     user_permissions = None
 
@@ -135,7 +140,9 @@ class ProductInfo(models.Model):
     """
     Модель Информации о продуктах
     """
-
+    product = models.ForeignKey(Product, verbose_name='Продукт',
+                                related_name='product_infos', blank=True, null=True,
+                                on_delete=models.CASCADE)
     external_id = models.PositiveIntegerField(verbose_name='Внешний ИД магазина')
     shop = models.ForeignKey(Shop, verbose_name='Магазин',
                              related_name='shop_product_infos', on_delete=models.CASCADE)
@@ -145,6 +152,7 @@ class ProductInfo(models.Model):
     model = models.CharField(max_length=80,verbose_name='Модель',blank=True)
     quantity = models.PositiveIntegerField(verbose_name='Количество')
     price = models.PositiveIntegerField(verbose_name='Цена')
+    price_rrc = models.PositiveIntegerField(verbose_name='Рекомендуемая цена', blank=True, null=True)
 
     class Meta:
         verbose_name = 'Информация о продукте'
