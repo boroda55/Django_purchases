@@ -11,8 +11,12 @@ from rest_framework import status
 from ujson import loads as load_json
 from yaml import load as load_yaml, Loader
 from requests import get
+from django.conf import settings
 from rest_framework.authtoken.models import Token
-from backend.models import Shop, Category, ProductInfo, Product, ProductParameter, Parameter, User, new_user_registered
+from backend.models import Shop, Category, ProductInfo, Product, ProductParameter, Parameter, User, new_user_registered, \
+    ConfirmEmailToken
+from datetime import timedelta
+from django.utils import timezone
 
 
 def status_response(status: bool, message: str = ""):
@@ -126,4 +130,88 @@ class UserRegister(APIView):
                 user = User.objects.create_user(**user_data)
                 new_user_registered.send(sender=self.__class__, user_id=user.id)
                 return JsonResponse(status_response(True, 'Пользователь зарегистрирован'), status=200)
-                # проверить регистрацию
+
+
+class UserActivation(APIView):
+    """
+        Класс для подтверждения email по ключу с проверкой срока действия
+    """
+    def post(self, request, *args, **kwargs):
+        if not {'email', 'key'}.issubset(request.data):
+            return JsonResponse(status_response(False, 'Не указаны все необходимые аргументы'),
+                                status=401)
+
+        try:
+            user = User.objects.get(email=request.data['email'])
+            key = ConfirmEmailToken.objects.get(user=user)
+
+
+            if (timezone.now() - key.created_at) > timedelta(hours=2):
+                key.delete()
+                return JsonResponse(
+                    status_response(False, 'Ключ просрочен. Запросите новый.'),
+                    status=400)
+
+            # Проверка токена
+            if key.key != request.data['key']:
+                return JsonResponse(
+                    status_response(False, f'Неверный ключ для {user.email}'),
+                    status=401)
+
+            # Активация пользователя
+            user.is_active = True
+            user.save()
+            key.delete()
+
+            return JsonResponse(
+                status_response(True, 'Email подтвержден! Теперь можно войти в систему.'),
+                status=200)
+
+        except (User.DoesNotExist, ConfirmEmailToken.DoesNotExist):
+            return JsonResponse(
+                status_response(False, 'Неверный email или токен'),
+                status=404)
+        except Exception as e:
+            return JsonResponse(
+                status_response(False, f'Ошибка: {str(e)}'),
+                status=500)
+
+# Нужно добавить класс по запросу нового key
+class GettingKeyAgain(APIView):
+    """
+    Повторное направления ключа активации
+    """
+    def post(self, request, *args, **kwargs):
+        if not {'email', 'password'}.issubset(request.data):
+            return JsonResponse(status_response(False, 'Не указаны все необходимые аргументы'),
+                                status=401)
+        try:
+            user = User.objects.get(email=request.data['email'])
+            if not user.check_password(request.data['password']):
+                return JsonResponse(
+                    status_response(False, 'Неверный пароль'),
+                    status=401
+                )
+            if user.is_active:
+                return JsonResponse(
+                    status_response(False, 'Пользователь уже активирован'),
+                    status=400
+                )
+            ConfirmEmailToken.objects.filter(user=user).delete()
+            new_user_registered.send(sender=self.__class__, user_id=user.id)
+            return JsonResponse(
+                status_response(True, 'На почту направлен новый ключ активации'),
+                status=200
+            )
+
+        except User.DoesNotExist:
+            return JsonResponse(
+                status_response(False, 'Пользователь с таким email не найден'),
+                status=404
+            )
+        except Exception as e:
+            return JsonResponse(
+                status_response(False, f'Ошибка: {str(e)}'),
+                status=500
+            )
+

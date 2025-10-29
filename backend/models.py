@@ -305,7 +305,7 @@ class ConfirmEmailToken(models.Model):
         return super(ConfirmEmailToken, self).save(*args, **kwargs)
 
     def __str__(self):
-        return f"Токен для сброса пароля пользователя {self.user}"
+        return f"Токен для активации пользователя {self.user}"
 
 
 
