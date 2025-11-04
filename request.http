@@ -1,22 +1,183 @@
 @baseUrl = http://localhost:8000/
-###
 
+###
 # импорт товаров
 # (необходимо авторизоваться и передавать токен пользователя;
 # требуемый тип пользователя - магазин)
 POST {{baseUrl}}/partner/update/
 Content-Type: application/json
-Authorization: token 51e09637715b51e01bb240894ce6071a6d81551e
+Authorization: token efaf0b1d2d38da041d82b8d34967126b90
 
 {
-    "url": "https://github.com/boroda55/Django_purchases/shop1.yaml"
+    "url": "https://raw.githubusercontent.com/boroda55/Django_purchases/refs/heads/main/shop1.yaml"
 }
 
 ###
+# Вход пользователя
 POST {{baseUrl}}/login/
 Content-Type: application/json
 
 {
-    "email": "1@1.ru",
-    "password": "1"
+    "email": "kirill@mail.ru",
+    "password": "QAZWSXEDC123"
 }
+
+
+###
+# Регистрация пользователя
+POST {{baseUrl}}/register/
+Content-Type: application/json
+
+{
+  "email": "kirill@mail.ru",
+  "username": "Kirill",
+  "password": "QAZWSXEDC123"
+
+}
+###
+# Активация пользователя через mail
+POST {{baseUrl}}/useractivation/
+Content-Type: application/json
+
+{
+  "email": "kirill@mail.ru",
+  "key": "929ebf8a2231524e96f945411bc"
+
+}
+
+
+###
+# Просмотр всех товаров постранично (палигация используется)
+GET {{baseUrl}}/products/?page=1
+
+###
+# Просмотр всех категорий
+GET {{baseUrl}}/categories/
+
+###
+# Просмотр всех магазинов
+GET {{baseUrl}}/shops/
+
+###
+# Просмотр корзины
+GET {{baseUrl}}/cart/
+Authorization: token efaf0b1d2d38da041d82b8d34967126b90
+
+###
+# Добавление товара:
+POST {{baseUrl}}/cart/add/
+Content-Type: application/json
+Authorization: token efaf0b1d2d38da041d82b8d34967126b90
+
+{
+  "product_info_id": 1,
+  "quantity": 2
+}
+
+
+###
+# Добавление товара:
+DELETE  {{baseUrl}}/cart/remove/
+Content-Type: application/json
+Authorization: token efaf0b1d2d38da041d82b8d34967126b90
+
+{
+  "item_id": 1
+}
+
+
+###
+# Обновление количества товара
+PUT {{baseUrl}}/cart/update/
+Content-Type: application/json
+Authorization: token efaf0b1d2d38da041d82b8d34967126b90
+
+{
+  "item_id": 2,
+  "quantity": 3
+}
+
+###
+# Очистка корзины с товарами
+DELETE {{baseUrl}}/cart/clear/
+Authorization: token efaf0b1d2d38da041d82b8d34967126b90
+
+###
+# Просмотр контактов
+GET {{baseUrl}}/contacts/
+Authorization: token efaf0b1d2d38da041d82b8d34967126b90
+
+
+###
+# Добавление контакта
+POST {{baseUrl}}/contacts/add/
+Content-Type: application/json
+Authorization: Token efaf0b1d2d38da041d82b8d34967126b90
+
+{
+    "phone": "+79991234567",
+    "city": "Москва",
+    "street": "Ленина",
+    "house": "10",
+    "apartment": "25"
+}
+
+
+###
+#Обновление контакта
+PUT {{baseUrl}}/contacts/update/
+Content-Type: application/json
+Authorization: Token efaf0b1d2d38da041d82b8d34967126b90
+
+{
+    "contact_id": 1,
+    "phone": "+79997654321",
+    "city": "Санкт-Петербург"
+}
+
+###
+# Удаление контакта
+DELETE {{baseUrl}}/contacts/delete/
+Content-Type: application/json
+Authorization: Token efaf0b1d2d38da041d82b8d34967126b90
+
+{
+"contact_id": 1
+}
+
+
+###
+# Подтверждение заказа
+POST {{baseUrl}}/order/confirm/
+Content-Type: application/json
+Authorization: Token efaf0b1d2d38da041d82b8d34967126b90
+
+{
+  "contact_id": 2
+}
+
+
+###
+# Просмотр списка заказов
+GET {{baseUrl}}/orders/
+Content-Type: application/json
+Authorization: Token efaf0b1d2d38da041d82b8d34967126b90
+
+
+###
+# Просмотр деталей заказа
+GET {{baseUrl}}/order/1/
+Content-Type: application/json
+Authorization: Token efaf0b1d2d38da041d82b8d34967126b90
+
+
+###
+# Отмена заказа
+POST {{baseUrl}}/order/cancel/
+Content-Type: application/json
+Authorization: Token efaf0b1d2d38da041d82b8d34967126b90
+
+{
+  "order_id": 1
+}
+
