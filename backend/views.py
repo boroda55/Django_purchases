@@ -15,11 +15,39 @@ from requests import get
 from django.conf import settings
 from rest_framework.authtoken.models import Token
 from backend.models import Shop, Category, ProductInfo, Product, ProductParameter, Parameter, User, new_user_registered, \
-    ConfirmEmailToken, Order, OrderItem, Contact, Address
+    ConfirmEmailToken, Order, OrderItem, Contact, Address, ProductImage
 from datetime import timedelta
 from django.utils import timezone
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.permissions import IsAuthenticated
+from .tasks import send_confirmation_email
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiExample
+from drf_spectacular.types import OpenApiTypes
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
+from backend.throttling import AuthRateThrottle, PartnerRateThrottle, HighFrequencyThrottle
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.authtoken.models import Token
+from drf_spectacular.utils import extend_schema, OpenApiResponse
+from rest_framework.parsers import MultiPartParser, FormParser
+from django.core.files.storage import default_storage
+from django.core.files.base import ContentFile
+import os
+import uuid
+import sentry_sdk
+from datetime import datetime
+from django.db import DatabaseError
+from rest_framework import status
+from drf_spectacular.utils import extend_schema, OpenApiResponse
+from backend.exceptions import PaymentProcessingException, InventoryException, \
+    ExternalAPIException, DataValidationException
+from rest_framework.views import exception_handler
+from backend.exceptions import BaseAPIException
+from django.views.decorators.cache import cache_page
+from django.utils.decorators import method_decorator
+from backend.cache_utils import cached_view, CacheManager, cache_metrics
+import time
 
 def status_response(status: bool, message: str = ""):
     """
@@ -40,6 +68,9 @@ class UpdatePrice(APIView):
     """
     Класс для обновления прайса от поставщика
     """
+    throttle_classes = [PartnerRateThrottle]
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
     def post(self, request, *args, **kwargs):
         if not request.user.is_authenticated:
             return JsonResponse(status_response(False,
@@ -87,8 +118,59 @@ class UpdatePrice(APIView):
 
 class UserLogin(APIView):
     """
-    Класс для входа пользователя
+    Аутентификация пользователя в системе.
+
+    При успешной аутентификации:
+    - Удаляются старые токены пользователя
+    - Создается новый токен аутентификации
+    - Возвращается токен для использования в последующих запросах
     """
+    throttle_classes = [AuthRateThrottle, HighFrequencyThrottle]
+
+    @extend_schema(
+        summary="Вход в систему",
+        description="Аутентификация пользователя по email и паролю",
+        request={
+            'application/json': {
+                'type': 'object',
+                'required': ['email', 'password'],
+                'properties': {
+                    'email': {'type': 'string', 'format': 'email', 'example': 'user@example.com'},
+                    'password': {'type': 'string', 'example': 'password123'}
+                }
+            }
+        },
+        responses={
+            200: {
+                'type': 'object',
+                'properties': {
+                    'Status': {'type': 'boolean', 'example': True},
+                    'Message': {'type': 'string', 'example': 'your_auth_token_here'}
+                }
+            },
+            400: {
+                'type': 'object',
+                'properties': {
+                    'Status': {'type': 'boolean', 'example': False},
+                    'Message': {'type': 'string', 'example': 'Не передан email или пароль'}
+                }
+            },
+            401: {
+                'type': 'object',
+                'properties': {
+                    'Status': {'type': 'boolean', 'example': False},
+                    'Message': {'type': 'string', 'example': 'Пользователя не существует'}
+                }
+            },
+            403: {
+                'type': 'object',
+                'properties': {
+                    'Status': {'type': 'boolean', 'example': False},
+                    'Message': {'type': 'string', 'example': 'Пользователь не активный'}
+                }
+            }
+        }
+    )
     def post(self, request, *args, **kwargs):
         if 'email' in request.data and 'password' in request.data:
             user = authenticate(request,
@@ -108,8 +190,83 @@ class UserLogin(APIView):
 
 class UserRegister(APIView):
     """
-       Класс для Регистрации пользователя
+        Регистрация нового пользователя в системе.
+
+        При успешной регистрации:
+        - Создается неактивный пользователь
+        - Отправляется email с токеном подтверждения
+        - Для магазинов автоматически устанавливается тип 'shop'
     """
+    throttle_classes = [AuthRateThrottle, HighFrequencyThrottle]
+
+
+    @extend_schema(
+        summary="Регистрация пользователя",
+        description="""
+            Регистрация нового пользователя в системе.
+
+            Особенности:
+            - Если указана компания, пользователь регистрируется как магазин
+            - После регистрации отправляется email с токеном подтверждения
+            - Пользователь создается неактивным до подтверждения email
+            """,
+        request={
+            'application/json': {
+                'type': 'object',
+                'required': ['email', 'username', 'password'],
+                'properties': {
+                    'email': {'type': 'string', 'format': 'email', 'example': 'user@example.com'},
+                    'username': {'type': 'string', 'example': 'john_doe'},
+                    'password': {'type': 'string', 'example': 'securepassword123'},
+                    'company': {'type': 'string', 'example': 'My Company LLC'},
+                }
+            }
+        },
+        responses={
+            200: {
+                'type': 'object',
+                'properties': {
+                    'Status': {'type': 'boolean', 'example': True},
+                    'Message': {'type': 'string', 'example': 'Пользователь зарегистрирован'}
+                }
+            },
+            401: {
+                'type': 'object',
+                'properties': {
+                    'Status': {'type': 'boolean', 'example': False},
+                    'Message': {'type': 'string', 'example': 'Не указаны все необходимые аргументы'}
+                }
+            },
+            403: {
+                'type': 'object',
+                'properties': {
+                    'Status': {'type': 'boolean', 'example': False},
+                    'Message': {'type': 'string', 'example': 'Пользователь с таким email уже существует'}
+                }
+            }
+        },
+        examples=[
+            OpenApiExample(
+                'Успешная регистрация покупателя',
+                value={
+                    'email': 'buyer@example.com',
+                    'username': 'buyer_user',
+                    'password': 'password123'
+                },
+                request_only=True
+            ),
+            OpenApiExample(
+                'Успешная регистрация магазина',
+                value={
+                    'email': 'shop@example.com',
+                    'username': 'shop_user',
+                    'password': 'password123',
+                    'company': 'Best Shop LLC'
+                },
+                request_only=True
+            )
+        ]
+    )
     def post(self, request, *args, **kwargs):
         if not {'email', 'username', 'password'}.issubset(request.data):
             return JsonResponse(status_response(False, 'Не указаны все необходимые аргументы'),
@@ -138,6 +295,8 @@ class UserActivation(APIView):
     """
         Класс для подтверждения email по ключу с проверкой срока действия
     """
+
+    throttle_classes = [AuthRateThrottle]
     def post(self, request, *args, **kwargs):
         if not {'email', 'key'}.issubset(request.data):
             return JsonResponse(status_response(False, 'Не указаны все необходимые аргументы'),
@@ -181,8 +340,9 @@ class UserActivation(APIView):
 # Нужно добавить класс по запросу нового key
 class GettingKeyAgain(APIView):
     """
-    Повторное направления ключа активации
+    Повторное направление ключа активации
     """
+    throttle_classes = [AuthRateThrottle]
     def post(self, request, *args, **kwargs):
         if not {'email', 'password'}.issubset(request.data):
             return JsonResponse(status_response(False, 'Не указаны все необходимые аргументы'),
@@ -199,8 +359,10 @@ class GettingKeyAgain(APIView):
                     status_response(False, 'Пользователь уже активирован'),
                     status=400
                 )
-            ConfirmEmailToken.objects.filter(user=user).delete()
-            new_user_registered.send(sender=self.__class__, user_id=user.id)
+
+            # Асинхронная отправка нового токена
+            send_confirmation_email.delay(user.id)
+
             return JsonResponse(
                 status_response(True, 'На почту направлен новый ключ активации'),
                 status=200
@@ -218,44 +380,96 @@ class GettingKeyAgain(APIView):
             )
 
 
+@extend_schema_view(
+    get=extend_schema(
+        summary="Получить список товаров",
+        description="""
+        Получение списка товаров с поддержкой фильтрации и пагинации.
+
+        Доступные фильтры:
+        - shop_id: фильтрация по магазину
+        - category_id: фильтрация по категории  
+        - name: поиск по названию товара
+        """,
+        parameters=[
+            OpenApiParameter(
+                name='shop_id',
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description='ID магазина для фильтрации'
+            ),
+            OpenApiParameter(
+                name='category_id',
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description='ID категории для фильтрации'
+            ),
+            OpenApiParameter(
+                name='name',
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                description='Название товара для поиска'
+            ),
+            OpenApiParameter(
+                name='page',
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description='Номер страницы'
+            ),
+            OpenApiParameter(
+                name='page_size',
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                description='Размер страницы (по умолчанию 20)'
+            )
+        ]
+    )
+)
 class ProductListView(APIView):
     """
-    Класс для получения списка товаров с пагинацией
-    """
+        Класс для получения списка товаров с пагинацией и кешированием
 
+        Предоставляет возможность:
+        - Просмотра списка товаров с пагинацией
+        - Фильтрации по магазину, категории и названию
+        - Получения детальной информации о каждом товаре
+    """
+    throttle_classes = [AnonRateThrottle]
+
+    @method_decorator(cache_page(60 * 15))
+    @cached_view(timeout=60 * 15, key_prefix="product_list_view")  # Дополнительное кеширование
     def get(self, request, *args, **kwargs):
         try:
+            start_time = time.time()
+
             # Базовый queryset с оптимизацией запросов
             products = ProductInfo.objects.filter(
-                quantity__gt=0  # только товары в наличии
+                quantity__gt=0
             ).select_related(
                 'product', 'shop', 'product__category'
             ).prefetch_related(
                 'product_parameters__parameter'
-            ).order_by('id')  # сортировка для стабильной пагинации
+            ).order_by('id')
 
-            # Фильтрация по магазину
+            # Фильтрация
             shop_id = request.query_params.get('shop_id')
             if shop_id:
                 products = products.filter(shop_id=shop_id)
 
-            # Фильтрация по категории
             category_id = request.query_params.get('category_id')
             if category_id:
                 products = products.filter(product__category_id=category_id)
 
-            # Фильтрация по названию товара (поиск)
             product_name = request.query_params.get('name')
             if product_name:
                 products = products.filter(name__icontains=product_name)
 
             # Пагинация
             paginator = PageNumberPagination()
-            paginator.page_size = request.query_params.get('page_size',
-                                                           20)  # размер страницы из параметра или 20 по умолчанию
+            paginator.page_size = request.query_params.get('page_size', 20)
             paginated_products = paginator.paginate_queryset(products, request)
 
-            # Подготовка данных для текущей страницы
+            # Подготовка данных
             product_list = []
             for product_info in paginated_products:
                 product_data = {
@@ -285,14 +499,18 @@ class ProductListView(APIView):
                 }
                 product_list.append(product_data)
 
-            # Возврат с пагинацией
-            return paginator.get_paginated_response({
+            response_data = {
                 'Status': True,
-                'Products': product_list
-            })
+                'Products': product_list,
+                'ExecutionTimeMs': round((time.time() - start_time) * 1000, 2)
+            }
+
+            # Добавляем пагинацию к ответу
+            response = paginator.get_paginated_response(response_data)
+            return response
 
         except Exception as e:
-            return JsonResponse({
+            return Response({
                 'Status': False,
                 'Error': str(e)
             }, status=500)
@@ -302,7 +520,12 @@ class CategoryListView(APIView):
     """
     Класс для получения списка категорий
     """
+
+    @method_decorator(cache_page(60 * 60))  # Кеширование на 1 час
+    @cached_view(timeout=60 * 60, key_prefix="category_list_view")
     def get(self, request, *args, **kwargs):
+        start_time = time.time()
+
         categories = Category.objects.all().prefetch_related('shops')
 
         category_list = []
@@ -314,14 +537,23 @@ class CategoryListView(APIView):
             }
             category_list.append(category_data)
 
-        return JsonResponse({'Status': True, 'Categories': category_list})
-
+        return Response({
+            'Status': True,
+            'Categories': category_list,
+            'ExecutionTimeMs': round((time.time() - start_time) * 1000, 2),
+            'Cached': True  # Показывает что данные из кеша
+        })
 
 class ShopListView(APIView):
     """
     Класс для получения списка магазинов
     """
+
+    @method_decorator(cache_page(60 * 30))  # Кеширование на 30 минут
+    @cached_view(timeout=60 * 30, key_prefix="shop_list_view")
     def get(self, request, *args, **kwargs):
+        start_time = time.time()
+
         shops = Shop.objects.filter(user__is_active=True)
 
         shop_list = []
@@ -334,12 +566,59 @@ class ShopListView(APIView):
             }
             shop_list.append(shop_data)
 
-        return JsonResponse({'Status': True, 'Shops': shop_list})
+        return Response({
+            'Status': True,
+            'Shops': shop_list,
+            'ExecutionTimeMs': round((time.time() - start_time) * 1000, 2),
+            'Cached': True
+        })
 
 
+@extend_schema_view(
+    get=extend_schema(
+        summary="Просмотр корзины",
+        description="Получение текущего состояния корзины пользователя",
+        responses={
+            200: {
+                'type': 'object',
+                'properties': {
+                    'Status': {'type': 'boolean'},
+                    'Message': {'type': 'string'},
+                    'Cart': {
+                        'type': 'object',
+                        'properties': {
+                            'order_id': {'type': 'integer'},
+                            'total_items': {'type': 'integer'},
+                            'total_amount': {'type': 'integer'},
+                            'items': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'id': {'type': 'integer'},
+                                        'product_name': {'type': 'string'},
+                                        'shop': {'type': 'string'},
+                                        'quantity': {'type': 'integer'},
+                                        'price': {'type': 'integer'},
+                                        'amount': {'type': 'integer'},
+                                        'product_info_id': {'type': 'integer'}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        auth=['TokenAuth']
+    )
+)
 class CartView(APIView):
     """
-    Класс для просмотра корзины
+    Управление корзиной покупок.
+
+    Требует аутентификации по токену.
+    Корзина автоматически создается при первом добавлении товара.
     """
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
@@ -399,10 +678,29 @@ class CartView(APIView):
                 'Error': str(e)
             }, status=500)
 
-
+@extend_schema_view(
+    post=extend_schema(
+        summary="Добавить товар в корзину",
+        description="Добавление товара в корзину пользователя",
+        request={
+            'application/json': {
+                'type': 'object',
+                'required': ['product_info_id', 'quantity'],
+                'properties': {
+                    'product_info_id': {'type': 'integer', 'example': 1},
+                    'quantity': {'type': 'integer', 'example': 2}
+                }
+            }
+        },
+        auth=['TokenAuth']
+    )
+)
 class AddToCartView(APIView):
     """
-    Класс для добавления товара в корзину
+    Добавление товаров в корзину.
+
+    Если товар уже есть в корзине - увеличивает количество.
+    Проверяет доступность товара на складе.
     """
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
@@ -935,7 +1233,6 @@ class ConfirmOrderView(APIView):
                 'Error': str(e)
             }, status=500)
 
-
 class OrderListView(APIView):
     """
     Класс для просмотра заказов пользователя
@@ -1140,6 +1437,830 @@ class CancelOrderView(APIView):
 
         except Exception as e:
             return JsonResponse({
+                'Status': False,
+                'Error': str(e)
+            }, status=500)
+
+
+class GoogleAuthSuccessView(APIView):
+    """
+    View для обработки успешной Google аутентификации
+    Возвращает токен для использования в API
+    """
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        summary="Успешная Google аутентификация",
+        description="""
+        Endpoint для обработки успешной аутентификации через Google.
+        Создает или обновляет токен для пользователя.
+        """,
+        responses={
+            200: OpenApiResponse(
+                description="Успешная аутентификация",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': True},
+                        'Message': {'type': 'string', 'example': 'Аутентификация успешна'},
+                        'Token': {'type': 'string', 'example': 'your_auth_token_here'},
+                        'User': {
+                            'type': 'object',
+                            'properties': {
+                                'id': {'type': 'integer', 'example': 1},
+                                'email': {'type': 'string', 'example': 'user@gmail.com'},
+                                'username': {'type': 'string', 'example': 'john_doe'},
+                                'first_name': {'type': 'string', 'example': 'John'},
+                                'last_name': {'type': 'string', 'example': 'Doe'},
+                                'type': {'type': 'string', 'example': 'buyer'}
+                            }
+                        }
+                    }
+                }
+            ),
+            401: OpenApiResponse(
+                description="Пользователь не аутентифицирован",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': False},
+                        'Message': {'type': 'string', 'example': 'Пользователь не аутентифицирован'}
+                    }
+                }
+            )
+        }
+    )
+    def get(self, request, *args, **kwargs):
+        if request.user.is_authenticated:
+            # Удаляем старые токены пользователя
+            Token.objects.filter(user=request.user).delete()
+
+            # Создаем новый токен
+            token = Token.objects.create(user=request.user)
+
+            user_data = {
+                'id': request.user.id,
+                'email': request.user.email,
+                'username': request.user.username,
+                'first_name': request.user.first_name,
+                'last_name': request.user.last_name,
+                'type': request.user.type
+            }
+
+            return Response({
+                'Status': True,
+                'Message': 'Google аутентификация успешна',
+                'Token': token.key,
+                'User': user_data
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            'Status': False,
+            'Message': 'Пользователь не аутентифицирован через Google'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+
+
+class GoogleAuthErrorView(APIView):
+    """
+    View для обработки ошибок Google аутентификации
+    """
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        summary="Ошибка Google аутентификации",
+        description="Endpoint для обработки ошибок аутентификации через Google",
+        responses={
+            400: OpenApiResponse(
+                description="Ошибка аутентификации",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': False},
+                        'Message': {'type': 'string', 'example': 'Ошибка аутентификации через Google'}
+                    }
+                }
+            )
+        }
+    )
+    def get(self, request, *args, **kwargs):
+        error_message = request.GET.get('message', 'Произошла ошибка при аутентификации через Google')
+
+        return Response({
+            'Status': False,
+            'Message': error_message
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+
+class GoogleAuthInitView(APIView):
+    """
+    View для получения URL для начала Google аутентификации
+    """
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        summary="URL для Google аутентификации",
+        description="Получение URL для начала аутентификации через Google OAuth2",
+        responses={
+            200: OpenApiResponse(
+                description="URL для Google аутентификации",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': True},
+                        'auth_url': {'type': 'string', 'example': '/api/auth/login/google-oauth2/'},
+                        'description': {'type': 'string',
+                                        'example': 'Перейдите по ссылке для аутентификации через Google'}
+                    }
+                }
+            )
+        }
+    )
+    def get(self, request, *args, **kwargs):
+        auth_url = '/api/auth/login/google-oauth2/'
+
+        return Response({
+            'Status': True,
+            'auth_url': auth_url,
+            'description': 'Перейдите по ссылке для аутентификации через Google. После успешной аутентификации вы будете перенаправлены на endpoint /api/auth/google/success/ где получите токен для API.'
+        }, status=status.HTTP_200_OK)
+
+
+class UserAvatarUploadView(APIView):
+    """
+    Класс для загрузки аватара пользователя
+    """
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    @extend_schema(
+        summary="Загрузка аватара пользователя",
+        description="""
+        Загрузка аватара пользователя с автоматической генерацией миниатюр.
+
+        Поддерживаемые форматы: JPG, JPEG, PNG, GIF, WebP
+        Максимальный размер: 5MB
+        """,
+        request={
+            'multipart/form-data': {
+                'type': 'object',
+                'properties': {
+                    'avatar': {
+                        'type': 'string',
+                        'format': 'binary',
+                        'description': 'Файл изображения'
+                    }
+                }
+            }
+        },
+        responses={
+            200: OpenApiResponse(
+                description="Аватар успешно загружен",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': True},
+                        'Message': {'type': 'string', 'example': 'Аватар успешно загружен'},
+                        'AvatarURL': {'type': 'string', 'example': '/media/avatars/2024/01/15/avatar.jpg'},
+                        'ThumbnailURL': {'type': 'string',
+                                         'example': '/media/avatars/thumbnails/2024/01/15/avatar_thumb.jpg'}
+                    }
+                }
+            ),
+            400: OpenApiResponse(
+                description="Ошибка загрузки",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': False},
+                        'Error': {'type': 'string', 'example': 'Файл слишком большой'}
+                    }
+                }
+            )
+        }
+    )
+    def put(self, request, *args, **kwargs):
+        try:
+            if 'avatar' not in request.FILES:
+                return Response({
+                    'Status': False,
+                    'Error': 'Файл не предоставлен'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            avatar_file = request.FILES['avatar']
+
+            # Проверка размера файла
+            if avatar_file.size > settings.MAX_UPLOAD_SIZE:
+                return Response({
+                    'Status': False,
+                    'Error': f'Файл слишком большой. Максимальный размер: {settings.MAX_UPLOAD_SIZE // 1024 // 1024}MB'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Проверка расширения файла
+            file_ext = avatar_file.name.split('.')[-1].lower()
+            if file_ext not in settings.ALLOWED_IMAGE_EXTENSIONS:
+                return Response({
+                    'Status': False,
+                    'Error': f'Неподдерживаемый формат файла. Разрешенные: {", ".join(settings.ALLOWED_IMAGE_EXTENSIONS)}'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Удаляем старый аватар если есть
+            if request.user.avatar:
+                request.user.avatar.delete(save=False)
+            if request.user.avatar_thumbnail:
+                request.user.avatar_thumbnail.delete(save=False)
+
+            # Сохраняем новый аватар
+            request.user.avatar = avatar_file
+            request.user.save()
+
+            # Запускаем асинхронную генерацию миниатюр
+            from backend.tasks import generate_avatar_thumbnails
+            generate_avatar_thumbnails.delay(request.user.id)
+
+            return Response({
+                'Status': True,
+                'Message': 'Аватар успешно загружен',
+                'AvatarURL': request.user.avatar.url,
+                'ThumbnailURL': request.user.avatar_thumbnail.url if request.user.avatar_thumbnail else None
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                'Status': False,
+                'Error': f'Ошибка при загрузке аватара: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ProductImageUploadView(APIView):
+    """
+    Класс для загрузки изображений товаров
+    """
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    @extend_schema(
+        summary="Загрузка изображения товара",
+        description="""
+        Загрузка изображения для товара с автоматической генерацией миниатюр.
+        Доступно только для магазинов.
+        """,
+        request={
+            'multipart/form-data': {
+                'type': 'object',
+                'properties': {
+                    'image': {
+                        'type': 'string',
+                        'format': 'binary',
+                        'description': 'Файл изображения товара'
+                    },
+                    'product_id': {
+                        'type': 'integer',
+                        'description': 'ID товара'
+                    },
+                    'is_main': {
+                        'type': 'boolean',
+                        'description': 'Сделать основным изображением'
+                    }
+                },
+                'required': ['image', 'product_id']
+            }
+        },
+        responses={
+            200: OpenApiResponse(
+                description="Изображение успешно загружено",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': True},
+                        'Message': {'type': 'string', 'example': 'Изображение успешно загружено'},
+                        'ImageId': {'type': 'integer', 'example': 1},
+                        'ImageURL': {'type': 'string', 'example': '/media/products/2024/01/15/image.jpg'},
+                        'ThumbnailURL': {'type': 'string', 'example': '/media/products/thumbnails/2024/01/15/thumb.jpg'}
+                    }
+                }
+            )
+        }
+    )
+    def post(self, request, *args, **kwargs):
+        try:
+            if request.user.type != 'shop':
+                return Response({
+                    'Status': False,
+                    'Error': 'Только магазины могут загружать изображения товаров'
+                }, status=status.HTTP_403_FORBIDDEN)
+
+            if 'image' not in request.FILES:
+                return Response({
+                    'Status': False,
+                    'Error': 'Файл изображения не предоставлен'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            product_id = request.data.get('product_id')
+            if not product_id:
+                return Response({
+                    'Status': False,
+                    'Error': 'Не указан ID товара'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Проверяем существование товара и принадлежность магазину
+            try:
+                product = Product.objects.get(id=product_id)
+                # Здесь можно добавить проверку принадлежности товара магазину пользователя
+            except Product.DoesNotExist:
+                return Response({
+                    'Status': False,
+                    'Error': 'Товар не найден'
+                }, status=status.HTTP_404_NOT_FOUND)
+
+            image_file = request.FILES['image']
+
+            # Проверка размера файла
+            if image_file.size > settings.MAX_UPLOAD_SIZE:
+                return Response({
+                    'Status': False,
+                    'Error': f'Файл слишком большой. Максимальный размер: {settings.MAX_UPLOAD_SIZE // 1024 // 1024}MB'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Проверка расширения файла
+            file_ext = image_file.name.split('.')[-1].lower()
+            if file_ext not in settings.ALLOWED_IMAGE_EXTENSIONS:
+                return Response({
+                    'Status': False,
+                    'Error': f'Неподдерживаемый формат файла. Разрешенные: {", ".join(settings.ALLOWED_IMAGE_EXTENSIONS)}'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # Создаем запись изображения
+            product_image = ProductImage.objects.create(
+                product=product,
+                image=image_file,
+                is_main=request.data.get('is_main', False)
+            )
+
+            # Если это основное изображение, обновляем связь в ProductInfo
+            if product_image.is_main:
+                product_info = ProductInfo.objects.filter(product=product).first()
+                if product_info:
+                    product_info.main_image = product_image
+                    product_info.save()
+
+            return Response({
+                'Status': True,
+                'Message': 'Изображение товара успешно загружено',
+                'ImageId': product_image.id,
+                'ImageURL': product_image.image.url,
+                'ThumbnailURL': product_image.thumbnail.url if product_image.thumbnail else None
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                'Status': False,
+                'Error': f'Ошибка при загрузке изображения: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class DeleteUserAvatarView(APIView):
+    """
+    Класс для удаления аватара пользователя
+    """
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Удаление аватара пользователя",
+        description="Удаление текущего аватара пользователя",
+        responses={
+            200: OpenApiResponse(
+                description="Аватар успешно удален",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': True},
+                        'Message': {'type': 'string', 'example': 'Аватар успешно удален'}
+                    }
+                }
+            )
+        }
+    )
+    def delete(self, request, *args, **kwargs):
+        try:
+            if request.user.avatar:
+                request.user.avatar.delete(save=False)
+            if request.user.avatar_thumbnail:
+                request.user.avatar_thumbnail.delete(save=False)
+
+            request.user.avatar = None
+            request.user.avatar_thumbnail = None
+            request.user.save()
+
+            return Response({
+                'Status': True,
+                'Message': 'Аватар успешно удален'
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            return Response({
+                'Status': False,
+                'Error': f'Ошибка при удалении аватара: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class SentryTestView(APIView):
+    """
+    Тестовый View для проверки интеграции с Sentry.
+    Генерирует различные типы исключений для мониторинга.
+    """
+    permission_classes = [AllowAny]
+
+
+    def get(self, request, *args, **kwargs):
+        exception_type = request.GET.get('exception_type', 'division_by_zero')
+
+        try:
+            if exception_type == 'all':
+                return self.generate_all_exceptions()
+
+            exception_info = self.generate_specific_exception(exception_type)
+
+            # Если мы здесь, значит исключение не было сгенерировано
+            return Response({
+                'Status': True,
+                'Message': f'Исключение типа "{exception_type}" не было сгенерировано',
+                'ExceptionInfo': exception_info
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            # Захватываем исключение и отправляем в Sentry с дополнительным контекстом
+            event_id = sentry_sdk.capture_exception(e)
+
+            # Добавляем кастомный контекст
+            sentry_sdk.set_context("test_exception", {
+                "exception_type": exception_type,
+                "test_timestamp": datetime.now().isoformat(),
+                "user_agent": request.META.get('HTTP_USER_AGENT', ''),
+                "query_params": dict(request.GET),
+            })
+
+            # Устанавливаем теги для лучшей фильтрации
+            sentry_sdk.set_tag("test_exception", "true")
+            sentry_sdk.set_tag("exception_type", exception_type)
+            sentry_sdk.set_tag("environment", "testing")
+
+            return Response({
+                'Status': False,
+                'Error': str(e),
+                'ExceptionType': type(e).__name__,
+                'SentryEventId': event_id,
+                'Message': f'Исключение "{type(e).__name__}" было отправлено в Sentry'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+    def generate_specific_exception(self, exception_type):
+        """Генерация конкретного типа исключения"""
+        exception_handlers = {
+            'division_by_zero': self._division_by_zero,
+            'index_error': self._index_error,
+            'key_error': self._key_error,
+            'type_error': self._type_error,
+            'value_error': self._value_error,
+            'attribute_error': self._attribute_error,
+            'import_error': self._import_error,
+            'database_error': self._database_error,
+            'payment_error': self._payment_error,
+            'inventory_error': self._inventory_error,
+            'external_api_error': self._external_api_error,
+            'validation_error': self._validation_error,
+        }
+
+        handler = exception_handlers.get(exception_type)
+        if handler:
+            return handler()
+
+        return {"error": f"Unknown exception type: {exception_type}"}
+
+    def generate_all_exceptions(self):
+        """Генерация всех типов исключений (для комплексного тестирования)"""
+        generated_exceptions = []
+
+        exception_types = [
+            'division_by_zero', 'index_error', 'key_error', 'type_error',
+            'value_error', 'attribute_error', 'payment_error', 'inventory_error'
+        ]
+
+        for exc_type in exception_types:
+            try:
+                self.generate_specific_exception(exc_type)
+                generated_exceptions.append(f"{exc_type}: generated")
+            except Exception as e:
+                # Ловим и логируем каждое исключение
+                event_id = sentry_sdk.capture_exception(e)
+                generated_exceptions.append(f"{exc_type}: {type(e).__name__} (Sentry: {event_id})")
+
+        return Response({
+            'Status': True,
+            'Message': 'Все тестовые исключения сгенерированы',
+            'GeneratedExceptions': generated_exceptions
+        }, status=status.HTTP_200_OK)
+
+    # Методы для генерации конкретных исключений
+    def _division_by_zero(self):
+        result = 1 / 0  # Это вызовет ZeroDivisionError
+        return {"result": result}
+
+    def _index_error(self):
+        items = [1, 2, 3]
+        result = items[10]  # IndexError
+        return {"result": result}
+
+    def _key_error(self):
+        data = {"name": "test"}
+        result = data["nonexistent_key"]  # KeyError
+        return {"result": result}
+
+    def _type_error(self):
+        result = "string" + 123  # TypeError
+        return {"result": result}
+
+    def _value_error(self):
+        result = int("not_a_number")  # ValueError
+        return {"result": result}
+
+    def _attribute_error(self):
+        result = None.some_method()  # AttributeError
+        return {"result": result}
+
+
+    def _database_error(self):
+        from django.db import DatabaseError
+        raise DatabaseError("Тестовая ошибка базы данных")
+
+    def _payment_error(self):
+        raise PaymentProcessingException(
+            detail="Не удалось обработать платеж через Stripe",
+            extra_context={
+                "payment_gateway": "stripe",
+                "amount": 1000,
+                "currency": "USD",
+                "user_id": 123
+            }
+        )
+
+    def _inventory_error(self):
+        raise InventoryException(
+            detail="Недостаточно товара на складе",
+            extra_context={
+                "product_id": 456,
+                "requested_quantity": 10,
+                "available_quantity": 5,
+                "warehouse": "main"
+            }
+        )
+
+    def _external_api_error(self):
+        raise ExternalAPIException(
+            detail="Сервис доставки временно недоступен",
+            extra_context={
+                "service": "delivery-api",
+                "endpoint": "/api/v1/shipping/calculate",
+                "status_code": 503,
+                "response_time": 5.2
+            }
+        )
+
+    def _validation_error(self):
+        raise DataValidationException(
+            detail="Неверный формат email адреса",
+            extra_context={
+                "field": "email",
+                "value": "invalid-email",
+                "pattern": r"^[^@]+@[^@]+\.[^@]+$",
+                "constraint": "must_be_valid_email"
+            }
+        )
+
+
+class SentryPerformanceTestView(APIView):
+    """
+    Тестовый View для проверки мониторинга производительности в Sentry
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, *args, **kwargs):
+        import time
+        from django.db import connection
+        from backend.models import Product
+
+        iterations = int(request.GET.get('iterations', 100))
+        delay = float(request.GET.get('delay', 0.01))
+
+        # Начинаем транзакцию для мониторинга производительности
+        with sentry_sdk.start_transaction(op="task", name="performance_test") as transaction:
+            # Устанавливаем теги для транзакции
+            transaction.set_tag("iterations", iterations)
+            transaction.set_tag("delay", delay)
+            transaction.set_tag("test_type", "performance")
+
+            start_time = time.time()
+            results = []
+
+            # Имитация нагрузки
+            for i in range(iterations):
+                # Создаем span для каждой итерации
+                with sentry_sdk.start_span(op="iteration", description=f"iteration_{i}") as span:
+                    # Имитация работы с базой данных
+                    products_count = Product.objects.count()
+
+                    # Имитация вычислений
+                    calculation_result = sum(x * x for x in range(1000))
+
+                    # Задержка
+                    time.sleep(delay)
+
+                    results.append({
+                        'iteration': i,
+                        'products_count': products_count,
+                        'calculation_result': calculation_result
+                    })
+
+                    span.set_data("products_count", products_count)
+                    span.set_data("calculation_result", calculation_result)
+
+            end_time = time.time()
+            total_time = end_time - start_time
+
+            # Устанавливаем метрики производительности
+            transaction.set_measurement("duration", total_time, "seconds")
+            transaction.set_measurement("iterations_per_second", iterations / total_time, "iterations/s")
+            transaction.set_measurement("avg_iteration_time", total_time / iterations, "seconds")
+
+            return Response({
+                'Status': True,
+                'Message': 'Тест производительности завершен',
+                'PerformanceMetrics': {
+                    'total_iterations': iterations,
+                    'total_time_seconds': round(total_time, 3),
+                    'iterations_per_second': round(iterations / total_time, 2),
+                    'avg_iteration_time_ms': round((total_time / iterations) * 1000, 3),
+                    'database_queries': len(connection.queries),
+                },
+                'ResultsSample': results[:5]  # Показываем только первые 5 результатов
+            }, status=status.HTTP_200_OK)
+
+
+def custom_exception_handler(exc, context):
+    """
+    Кастомный обработчик исключений для Sentry
+    """
+    # Call REST framework's default exception handler first
+    response = exception_handler(exc, context)
+
+    # Если это наше кастомное исключение, логируем в Sentry
+    if isinstance(exc, BaseAPIException):
+        # Логируем кастомное исключение с дополнительным контекстом
+        sentry_sdk.capture_exception(exc, extra={
+            "exception_detail": exc.detail,
+            "exception_code": exc.code,
+            "extra_context": exc.extra_context,
+            "view": context.get('view').__class__.__name__ if context.get('view') else None,
+            "request_method": context['request'].method if context.get('request') else None,
+        })
+
+    return response
+
+
+class CacheStatsView(APIView):
+    """
+    API для получения статистики кеширования
+    """
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        summary="Статистика кеширования",
+        description="Получение метрик производительности кеширования",
+        responses={
+            200: OpenApiResponse(
+                description="Статистика кеширования",
+                response={
+                    'type': 'object',
+                    'properties': {
+                        'Status': {'type': 'boolean', 'example': True},
+                        'cache_stats': {
+                            'type': 'object',
+                            'properties': {
+                                'total_requests': {'type': 'integer', 'example': 100},
+                                'hits': {'type': 'integer', 'example': 75},
+                                'misses': {'type': 'integer', 'example': 25},
+                                'hit_rate_percent': {'type': 'number', 'example': 75.0},
+                                'avg_time_with_cache_ms': {'type': 'number', 'example': 5.2},
+                                'avg_time_without_cache_ms': {'type': 'number', 'example': 150.8},
+                                'total_time_saved_seconds': {'type': 'number', 'example': 12.5}
+                            }
+                        },
+                        'redis_info': {
+                            'type': 'object',
+                            'properties': {
+                                'connected_clients': {'type': 'integer', 'example': 5},
+                                'used_memory_human': {'type': 'string', 'example': '2.5M'},
+                                'keyspace_hits': {'type': 'integer', 'example': 1000},
+                                'keyspace_misses': {'type': 'integer', 'example': 100}
+                            }
+                        }
+                    }
+                }
+            )
+        }
+    )
+    def get(self, request, *args, **kwargs):
+        try:
+            from django.core.cache import cache
+            import redis
+
+            # Получаем статистику кеширования
+            cache_stats = cache_metrics.get_stats()
+
+            # Получаем информацию о Redis
+            redis_info = {}
+            try:
+                # Пытаемся получить информацию из Redis
+                redis_client = cache._cache.get_client()
+                info = redis_client.info()
+
+                redis_info = {
+                    'connected_clients': info.get('connected_clients', 0),
+                    'used_memory_human': info.get('used_memory_human', '0K'),
+                    'keyspace_hits': info.get('keyspace_hits', 0),
+                    'keyspace_misses': info.get('keyspace_misses', 0),
+                    'hit_rate_percent': round(
+                        info.get('keyspace_hits', 0) /
+                        max(info.get('keyspace_hits', 0) + info.get('keyspace_misses', 1), 1) * 100, 2
+                    ),
+                    'total_keys': sum(
+                        int(db.get('keys', 0))
+                        for db in info.get('keyspace', {}).values()
+                    )
+                }
+            except (AttributeError, redis.ConnectionError):
+                redis_info = {'error': 'Redis information not available'}
+
+            return Response({
+                'Status': True,
+                'cache_stats': cache_stats,
+                'redis_info': redis_info
+            })
+
+        except Exception as e:
+            return Response({
+                'Status': False,
+                'Error': str(e)
+            }, status=500)
+
+
+class CacheManagementView(APIView):
+    """
+    API для управления кешем (очистка, инвалидация)
+    """
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(
+        summary="Очистка кеша",
+        description="Очистка всего кеша или определенных паттернов",
+        request={
+            'application/json': {
+                'type': 'object',
+                'properties': {
+                    'pattern': {
+                        'type': 'string',
+                        'example': '*product*',
+                        'description': 'Паттерн для очистки (оставьте пустым для очистки всего кеша)'
+                    }
+                }
+            }
+        }
+    )
+    def post(self, request, *args, **kwargs):
+        try:
+            from django.core.cache import cache
+            from backend.cache_utils import invalidate_cache_pattern
+
+            pattern = request.data.get('pattern')
+
+            if pattern:
+                # Очистка по паттерну
+                cleared_count = invalidate_cache_pattern(pattern)
+                message = f'Очищено {cleared_count} ключей по паттерну: {pattern}'
+            else:
+                # Очистка всего кеша
+                cache.clear()
+                message = 'Весь кеш очищен'
+
+            return Response({
+                'Status': True,
+                'Message': message
+            })
+
+        except Exception as e:
+            return Response({
                 'Status': False,
                 'Error': str(e)
             }, status=500)

@@ -181,3 +181,6 @@ Authorization: Token efaf0b1d2d38da041d82b8d34967126b90
   "order_id": 1
 }
 
+
+###
+GET {{baseUrl}}/api/auth/google/init/

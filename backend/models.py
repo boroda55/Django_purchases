@@ -4,6 +4,10 @@ from django.contrib.auth.validators import UnicodeUsernameValidator
 from django.db import models
 from django_rest_passwordreset.tokens import get_token_generator
 from django.dispatch import Signal
+from imagekit.models import ProcessedImageField
+from imagekit.processors import ResizeToFill, ResizeToFit
+from django.core.files.base import ContentFile
+import os
 
 new_user_registered = Signal()
 STATE_CHOICES = (
@@ -75,9 +79,25 @@ class User(AbstractUser):
     username = models.CharField('Имя', max_length=150, validators=[username_validator])
     is_active = models.BooleanField('Активация', default=False)
     type = models.CharField('Тип пользователя',default='buyer' , max_length=5, choices=USER_TYPE_CHOICES)
-    groups = None
-    user_permissions = None
+    avatar = ProcessedImageField(
+        upload_to='avatars/%Y/%m/%d/',
+        processors=[ResizeToFill(200, 200)],
+        format='JPEG',
+        options={'quality': 80},
+        null=True,
+        blank=True,
+        verbose_name='Аватар'
+    )
 
+    avatar_thumbnail = ProcessedImageField(
+        upload_to='avatars/thumbnails/%Y/%m/%d/',
+        processors=[ResizeToFill(50, 50)],
+        format='JPEG',
+        options={'quality': 70},
+        null=True,
+        blank=True,
+        verbose_name='Миниатюра аватара'
+    )
     def __str__(self):
         return f'{self.email}'
 
@@ -85,6 +105,34 @@ class User(AbstractUser):
         verbose_name = 'Пользователь'
         verbose_name_plural = 'Список пользователей'
         ordering = ('email',)
+
+    def save(self, *args, **kwargs):
+        # При сохранении обновляем миниатюру если изменился аватар
+        if self.avatar and (not self.avatar_thumbnail or not os.path.exists(self.avatar_thumbnail.path)):
+            self.generate_avatar_thumbnail()
+        super().save(*args, **kwargs)
+
+    def generate_avatar_thumbnail(self):
+        """Генерация миниатюры аватара"""
+        from io import BytesIO
+        from PIL import Image
+        from django.core.files.images import ImageFile
+
+        if self.avatar:
+            # Открываем оригинальное изображение
+            img = Image.open(self.avatar)
+
+            # Создаем миниатюру
+            img.thumbnail((50, 50), Image.Resampling.LANCZOS)
+
+            # Сохраняем в памяти
+            thumb_io = BytesIO()
+            img.save(thumb_io, format='JPEG', quality=70)
+
+            # Создаем файл миниатюры
+            thumb_file = ImageFile(thumb_io, name=f'avatar_thumb_{self.id}.jpg')
+            self.avatar_thumbnail.save(thumb_file.name, thumb_file, save=False)
+
 
 
 class Shop(models.Model):
@@ -135,6 +183,51 @@ class Product(models.Model):
     def __str__(self):
         return self.name
 
+class ProductImage(models.Model):
+    """
+    Модель для изображений товаров
+    """
+    product = models.ForeignKey(Product, verbose_name='Товар',
+                                related_name='images', on_delete=models.CASCADE)
+
+    image = ProcessedImageField(
+        upload_to='products/%Y/%m/%d/',
+        processors=[ResizeToFit(1200, 1200)],
+        format='JPEG',
+        options={'quality': 85},
+        verbose_name='Изображение товара'
+    )
+
+    thumbnail = ProcessedImageField(
+        upload_to='products/thumbnails/%Y/%m/%d/',
+        processors=[ResizeToFill(150, 150)],
+        format='JPEG',
+        options={'quality': 75},
+        verbose_name='Миниатюра'
+    )
+
+    is_main = models.BooleanField('Основное изображение', default=False)
+    order = models.PositiveIntegerField('Порядок', default=0)
+    created_at = models.DateTimeField('Дата создания', auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Изображение товара'
+        verbose_name_plural = 'Изображения товаров'
+        ordering = ['order', 'created_at']
+
+    def __str__(self):
+        return f"Изображение {self.product.name}"
+
+    def save(self, *args, **kwargs):
+        # Если это первое изображение товара, делаем его основным
+        if not self.pk and not self.product.images.exists():
+            self.is_main = True
+
+        super().save(*args, **kwargs)
+
+        # Автоматически генерируем миниатюру через Celery
+        from backend.tasks import generate_product_thumbnail
+        generate_product_thumbnail.delay(self.id)
 
 class ProductInfo(models.Model):
     """
@@ -153,6 +246,9 @@ class ProductInfo(models.Model):
     quantity = models.PositiveIntegerField(verbose_name='Количество')
     price = models.PositiveIntegerField(verbose_name='Цена')
     price_rrc = models.PositiveIntegerField(verbose_name='Рекомендуемая цена', blank=True, null=True)
+    main_image = models.ForeignKey(ProductImage, verbose_name='Основное изображение',
+                                   null=True, blank=True, on_delete=models.SET_NULL,
+                                   related_name='main_product_info')
 
     class Meta:
         verbose_name = 'Информация о продукте'
@@ -167,6 +263,17 @@ class ProductInfo(models.Model):
     def __str__(self):
         return f"{self.name} ({self.shop.name})"
 
+    def get_main_image_url(self):
+        """Получение URL основного изображения"""
+        if self.main_image:
+            return self.main_image.image.url
+        return None
+
+    def get_thumbnail_url(self):
+        """Получение URL миниатюры"""
+        if self.main_image:
+            return self.main_image.thumbnail.url
+        return None
 
 class Parameter(models.Model):
     """

@@ -13,6 +13,10 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import sentry_sdk
+from sentry_sdk.integrations.django import DjangoIntegration
+from sentry_sdk.integrations.celery import CeleryIntegration
+from sentry_sdk.integrations.redis import RedisIntegration
 load_dotenv()
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -34,6 +38,30 @@ AUTH_USER_MODEL = 'backend.User'
 
 # Application definition
 
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media/')
+
+IMAGEKIT_CACHEFILE_DIR = 'cache'
+IMAGEKIT_DEFAULT_CACHEFILE_BACKEND = 'imagekit.cachefiles.backends.Simple'
+IMAGEKIT_DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
+
+AVATAR_SIZES = {
+    'small': (50, 50),
+    'medium': (100, 100),
+    'large': (200, 200),
+}
+
+PRODUCT_IMAGE_SIZES = {
+    'thumbnail': (150, 150),
+    'small': (300, 300),
+    'medium': (600, 600),
+    'large': (1200, 1200),
+}
+
+MAX_UPLOAD_SIZE = 5242880
+ALLOWED_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp']
+
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -45,9 +73,18 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'django_rest_passwordreset',
     'rest_framework',
+    'drf_spectacular',
+    'drf_spectacular_sidecar',
+    'social_django',
+    'cacheops',
     #'backend.apps.BackendConfig'
 
 ]
+
+AUTHENTICATION_BACKENDS = (
+    'social_core.backends.google.GoogleOAuth2',
+    'django.contrib.auth.backends.ModelBackend',
+)
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -58,6 +95,9 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'backend.middleware.DisableCSRFMiddleware',
+    'social_django.middleware.SocialAuthExceptionMiddleware',
+    'backend.sentry_middleware.SentryContextMiddleware',
+    'backend.sentry_middleware.SentryPerformanceMiddleware',
 ]
 
 ROOT_URLCONF = 'purchases.urls'
@@ -87,11 +127,28 @@ REST_FRAMEWORK = {
         'rest_framework.authentication.TokenAuthentication',
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 20
+    'PAGE_SIZE': 20,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+        'backend.throttling.BurstRateThrottle',
+        'backend.throttling.SustainedRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '100/day',        # 100 запросов в день для анонимов
+        'user': '1000/day',       # 1000 запросов в день для авторизованных
+        'burst': '60/minute',     # 60 запросов в минуту (кратковременные)
+        'sustained': '1000/hour', # 1000 запросов в час (длительные)
+        'auth': '10/minute',      # специально для endpoints аутентификации
+        'partner': '50/hour',     # для партнерских endpoints
+    },
+    'EXCEPTION_HANDLER': 'backend.views.custom_exception_handler',
 }
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:8000',
     'http://127.0.0.1:8000',
+    'https://accounts.google.com',
     # добавьте ваши домены
 ]
 CSRF_COOKIE_HTTPONLY = False
@@ -153,6 +210,12 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0')
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = TIME_ZONE
 
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_USE_TLS = False
@@ -162,3 +225,193 @@ EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD')
 EMAIL_PORT = 465
 EMAIL_USE_SSL = True
 SERVER_EMAIL = EMAIL_HOST_USER
+DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Purchases API',
+    'DESCRIPTION': 'API для интернет-магазина с системой заказов и управления товарами',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'SWAGGER_UI_DIST': 'SIDECAR',
+    'SWAGGER_UI_FAVICON_HREF': 'SIDECAR',
+    'REDOC_DIST': 'SIDECAR',
+
+    # Дополнительные настройки
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SCHEMA_PATH_PREFIX': r'/api/v1/',
+
+    # Автоматическая документация для кастомных методов
+    'POSTPROCESSING_HOOKS': [
+        'drf_spectacular.hooks.postprocess_schema_enums',
+    ],
+
+    # Настройки для Token аутентификации
+    'SECURITY': [
+        {'TokenAuth': []},
+    ],
+    'SECURITY_DEFINITIONS': {
+        'TokenAuth': {
+            'type': 'apiKey',
+            'in': 'header',
+            'name': 'Authorization',
+            'description': 'Token-based authentication with format: Token <token>'
+        }
+    },
+}
+
+# Social Auth конфигурация
+SOCIAL_AUTH_JSONFIELD_ENABLED = True
+SOCIAL_AUTH_URL_NAMESPACE = 'social'
+
+# Google Configuration
+SOCIAL_AUTH_GOOGLE_OAUTH2_KEY = os.getenv('GOOGLE_OAUTH2_CLIENT_ID', '')
+SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET = os.getenv('GOOGLE_OAUTH2_CLIENT_SECRET', '')
+SOCIAL_AUTH_GOOGLE_OAUTH2_SCOPE = [
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
+]
+
+# Pipeline для обработки пользователей
+SOCIAL_AUTH_PIPELINE = (
+    'social_core.pipeline.social_auth.social_details',
+    'social_core.pipeline.social_auth.social_uid',
+    'social_core.pipeline.social_auth.auth_allowed',
+    'social_core.pipeline.social_auth.social_user',
+    'social_core.pipeline.user.get_username',
+    'social_core.pipeline.user.create_user',
+    'social_core.pipeline.social_auth.associate_user',
+    'social_core.pipeline.social_auth.load_extra_data',
+    'social_core.pipeline.user.user_details',
+    'backend.pipeline.set_user_type',  # наш кастомный pipeline
+)
+
+# Редиректы
+SOCIAL_AUTH_LOGIN_REDIRECT_URL = '/api/auth/google/success/'
+SOCIAL_AUTH_LOGIN_ERROR_URL = '/api/auth/google/error/'
+SOCIAL_AUTH_NEW_USER_REDIRECT_URL = '/api/auth/google/success/'
+
+# Дополнительные настройки
+SOCIAL_AUTH_USER_FIELDS = ['email', 'username']
+SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL = True
+SOCIAL_AUTH_PROTECTED_USER_FIELDS = ['email', 'username']
+
+# Google-specific настройки
+SOCIAL_AUTH_GOOGLE_OAUTH2_AUTH_EXTRA_ARGUMENTS = {
+    'access_type': 'online',
+    'prompt': 'select_account',
+}
+
+# Sentry Configuration
+SENTRY_DSN = os.getenv('SENTRY_DSN', '')
+SENTRY_ENVIRONMENT = os.getenv('SENTRY_ENVIRONMENT', 'development')
+SENTRY_TRACES_SAMPLE_RATE = float(os.getenv('SENTRY_TRACES_SAMPLE_RATE', '1.0'))
+SENTRY_PROFILES_SAMPLE_RATE = float(os.getenv('SENTRY_PROFILES_SAMPLE_RATE', '1.0'))
+
+# Инициализация Sentry только при наличии валидного DSN
+if SENTRY_DSN and SENTRY_DSN.startswith('https://') and 'your-project-id' not in SENTRY_DSN:
+    import sentry_sdk
+    from sentry_sdk.integrations.django import DjangoIntegration
+    from sentry_sdk.integrations.celery import CeleryIntegration
+    from sentry_sdk.integrations.redis import RedisIntegration
+
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        integrations=[
+            DjangoIntegration(),
+            CeleryIntegration(),
+            RedisIntegration(),
+        ],
+        traces_sample_rate=1.0,
+        send_default_pii=True,
+        environment=os.getenv('SENTRY_ENVIRONMENT', 'development'),
+        debug=DEBUG,
+    )
+
+    print("✅ Sentry инициализирован")
+else:
+    print("⚠️  Sentry не инициализирован - не указан валидный DSN")
+
+    # Добавляем кастомные теги
+    with sentry_sdk.configure_scope() as scope:
+        scope.set_tag("service", "purchases-api")
+        scope.set_tag("version", "1.0.0")
+
+
+# Redis Configuration
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = os.getenv('REDIS_PORT', 6379)
+REDIS_DB = os.getenv('REDIS_DB', 0)
+REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', None)
+
+# Cache Configuration
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': f'redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}',
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'PASSWORD': REDIS_PASSWORD,
+            'SOCKET_CONNECT_TIMEOUT': 5,  # seconds
+            'SOCKET_TIMEOUT': 5,  # seconds
+            'CONNECTION_POOL_KWARGS': {
+                'max_connections': 100,
+                'retry_on_timeout': True
+            },
+            'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+        },
+        'KEY_PREFIX': 'purchases',
+    }
+}
+
+# Cacheops Configuration (автоматическое кеширование запросов)
+CACHEOPS_REDIS = {
+    'host': REDIS_HOST,
+    'port': REDIS_PORT,
+    'db': REDIS_DB,
+    'password': REDIS_PASSWORD,
+    'socket_timeout': 5,
+}
+
+CACHEOPS = {
+    # Автоматическое кеширование всех запросов к основным моделям
+    'backend.*': {
+        'ops': 'all',
+        'timeout': 60 * 60,  # 1 час
+    },
+    'auth.user': {
+        'ops': 'all',
+        'timeout': 60 * 15,  # 15 минут
+    },
+    'backend.shop': {
+        'ops': 'all',
+        'timeout': 60 * 30,  # 30 минут
+    },
+    'backend.category': {
+        'ops': 'all',
+        'timeout': 60 * 60,  # 1 час
+    },
+    'backend.product': {
+        'ops': 'all',
+        'timeout': 60 * 30,  # 30 минут
+    },
+    'backend.productinfo': {
+        'ops': 'get',
+        'timeout': 60 * 15,  # 15 минут
+    },
+}
+
+# Session cache (опционально)
+SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
+SESSION_CACHE_ALIAS = 'default'
+
+# Cache middleware
+CACHE_MIDDLEWARE_SECONDS = 60 * 15  # 15 минут
+CACHE_MIDDLEWARE_KEY_PREFIX = 'purchases'
+
+# Cache timeout settings
+CACHE_TTL = {
+    'SHORT': 60 * 5,      # 5 минут
+    'MEDIUM': 60 * 30,    # 30 минут
+    'LONG': 60 * 60,      # 1 час
+    'VERY_LONG': 60 * 60 * 24,  # 1 день
+}
